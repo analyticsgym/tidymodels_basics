@@ -1,0 +1,161 @@
+---
+title: "Tidymodels Basics"
+output: rmarkdown::github_document
+---
+
+### Overview
+- This notebook covers basic modeling code patterns using the tidymodels framework.
+- "The tidymodels framework is a collection of packages for modeling and machine learning using tidyverse principles." - [tidymodels.org](https://www.tidymodels.org/)
+- Book: [Tidy Modeling with R by Max Kuhn AND Julia Silge](https://www.tmwr.org/)
+- Using OpenIntro Lending Club [loan data](https://www.openintro.org/data/index.php?data=loans_full_schema) uncover key predictors/drivers for loan interest rates.
+
+```{r echo=FALSE, include = FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, dpi=700, fig.cap=TRUE)
+```
+
+```{r}
+options(scipen=999) 
+library(tidyverse)
+library(tidymodels)
+library(openintro)
+library(janitor)
+library(skimr)
+```
+
+### Data Setup
+- Lending Club is a peer to peer loan platform. The data explored in this notebook represents loans made (see link above for more details).
+- Imagine we're tasked with understanding what are drivers behind loan interest rates.
+- This is a practice scenario (this might not be a relevant business question internal to Lending Club). 
+
+```{r}
+individual_loans <- loans_full_schema %>%
+      ### build model on subset of individual loans granted
+      ### joint also included in the dataset
+      filter(application_type=="individual") %>%
+      ### subjective human decision to exclude certain features
+      dplyr::select(
+             -emp_title,
+             -emp_length,
+             -state,
+             -annual_income_joint,
+             -verification_income_joint,
+             -application_type,
+             -grade:-paid_late_fees)
+
+### collect set of columns that contain NAs
+### in real world more care even to understand NAs 
+### and or use imputation methods to fill NAs in
+na_cols <- individual_loans %>%
+      summarise_all(.funs = ~sum(is.na(.))) %>%
+      gather() %>%
+      arrange(desc(value)) %>%
+      filter(value>0) %>%
+      pull(key)
+
+### drop NA columns to get a practice modeling dataset
+individual_loans <- individual_loans %>%
+      dplyr::select(-any_of(na_cols))
+```
+
+### Brief EDA
+- Brief numeric feature summary stats for starting point modeling data.
+- More EDA work would be done here in a real world setting to inspire modeling approach and feature engineering. 
+
+```{r}
+skimr::skim_without_charts(individual_loans) %>%
+      yank("numeric") %>%
+      select(-n_missing, -complete_rate)
+```
+### Create train and test data
+```{r}
+### generate boiler plate code pattern with usemodels package to speed up workflow
+### usemodels::use_glmnet(interest_rate ~ ., data = individual_loans)
+### models that usemodels package generates boiler plate code for: ls("package:usemodels", pattern = "^use_")
+set.seed(123)
+loans_split <- initial_split(individual_loans, prop=0.8, strata=interest_rate)
+loans_train <- training(loans_split)
+loans_test <- testing(loans_split)
+
+set.seed(123)
+### 5 fold cross validation
+loans_folds <- vfold_cv(loans_train, v=5)
+```
+
+### Set model type
+```{r}
+lasso_regression_mod <- 
+  ### lasso linear regression
+  linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+```
+
+### Feature engineering recipe
+```{r}
+lasso_regression_recipe <- 
+      recipe(formula = interest_rate ~ ., data = loans_train) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) 
+```
+
+### Build modeling workflow
+```{r}
+lasso_regression_workflow <- 
+      workflow() %>% 
+      add_model(lasso_regression_mod) %>% 
+      add_recipe(lasso_regression_recipe)
+```
+
+### Parameter Tuning
+- Similar results for small penalty values
+```{r}
+lasso_regression_grid <- tibble(penalty = 10^seq(-6, -1, length.out = 5)) 
+
+lasso_regression_tune <- 
+      tune_grid(lasso_regression_workflow, 
+                resamples = loans_folds, 
+                grid = lasso_regression_grid)
+
+lasso_regression_tune %>%
+      collect_metrics() %>%
+      filter(.metric=="rmse")
+```
+### Fit final model based on param tuning results
+```{r}
+best_params <- lasso_regression_tune %>% select_best("rmse")
+
+lasso_regression_final_params <- 
+  tibble(penalty = best_params$penalty)
+
+final_lasso_regression_workflow <- 
+  lasso_regression_workflow %>%
+  finalize_workflow(parameters = lasso_regression_final_params)
+
+final_lasso_regression_fit <- 
+  final_lasso_regression_workflow %>%
+  fit(loans_train)
+```
+
+### Variable importance
+- Pulse check on features that are most influencial on interest rate prediction
+
+```{r}
+final_lasso_regression_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vi(lambda = best_params$penalty, method="model") %>%
+  filter(row_number()<=15) %>%
+  ggplot(aes(x = Importance, y = reorder(Variable, Importance), fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+### Test data model performance
+
+```{r}
+predict(final_lasso_regression_fit, loans_test) %>%
+      mutate(actual = loans_test$interest_rate) %>%
+      rmse(truth=actual, estimate=.pred)
+```
